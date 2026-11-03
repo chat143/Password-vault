@@ -1,0 +1,156 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Step 1 - Check files"
+        run: |
+          missing=0
+          for f in settings.gradle.kts build.gradle.kts AndroidManifest.xml MainActivity.kt ic_launcher_art.xml; do
+            if [ ! -f "$f" ]; then
+              echo "::error title=File missing::$f is missing from the repo root"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: "Step 2 - Arrange project folders"
+        run: |
+          mkdir -p app/src/main/java/com/adnan/passwordvault
+          mv build.gradle.kts app/build.gradle.kts
+          mv AndroidManifest.xml app/src/main/AndroidManifest.xml
+          mv MainActivity.kt app/src/main/java/com/adnan/passwordvault/MainActivity.kt
+          mkdir -p app/src/main/res/drawable app/src/main/res/drawable-v26
+          cp ic_launcher_art.xml app/src/main/res/drawable/ic_launcher_art.xml
+          mv ic_launcher_art.xml app/src/main/res/drawable/ic_launcher.xml
+          cat > app/src/main/res/drawable-v26/ic_launcher.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_art"/>
+              <foreground android:drawable="@android:color/transparent"/>
+          </adaptive-icon>
+          XML
+
+      - name: "Step 2b - Download fonts (optional, build continues if it fails)"
+        continue-on-error: true
+        run: |
+          mkdir -p app/src/main/assets/fonts
+          base="https://github.com/google/fonts/raw/main/ofl/hindsiliguri"
+          for w in Regular Medium SemiBold Bold; do
+            if curl -fsSL --retry 3 -o "app/src/main/assets/fonts/HindSiliguri-$w.ttf" "$base/HindSiliguri-$w.ttf"; then
+              echo "font $w downloaded"
+            else
+              rm -f "app/src/main/assets/fonts/HindSiliguri-$w.ttf"
+              echo "::warning title=Font::$w could not be downloaded, system font will be used for it"
+            fi
+          done
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: "Step 3 - Build APK"
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle assembleDebug -Pandroid.useAndroidX=true --stacktrace --console=plain --no-daemon 2>&1 | tee build.log
+
+      - name: "Why did it fail?"
+        if: failure() && steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          set +e
+          S="$GITHUB_STEP_SUMMARY"
+          CLEAN='s#file:///home/runner/work/[^/]*/[^/]*/##g; s#/home/runner/work/[^/]*/[^/]*/##g'
+          FOUND=0
+          echo "## ❌ Build failed" >> "$S"
+          echo "" >> "$S"
+
+          if grep -qE '^e: ' build.log; then
+            FOUND=1
+            echo "### Kotlin code error (file:line:column)" >> "$S"
+            echo '```' >> "$S"
+            grep -E '^e: ' build.log | sed "$CLEAN" | sort -u | head -30 >> "$S"
+            echo '```' >> "$S"
+            grep -E '^e: ' build.log | sed "$CLEAN" | sort -u | head -20 | while IFS= read -r l; do
+              echo "::error title=Kotlin code error::$l"
+            done
+          fi
+
+          if grep -qE 'Could not resolve|Could not download|Could not GET' build.log; then
+            FOUND=1
+            echo "### Dependency download problem" >> "$S"
+            echo '```' >> "$S"
+            grep -E 'Could not resolve|Could not download|Could not GET' build.log | sed "$CLEAN" | sort -u | head -10 >> "$S"
+            echo '```' >> "$S"
+            echo "::error title=Dependency problem::a library could not be downloaded (check version or internet)"
+          fi
+
+          if grep -qE 'AAPT|Manifest merger failed|error: ' build.log; then
+            FOUND=1
+            echo "### Manifest / resource error" >> "$S"
+            echo '```' >> "$S"
+            grep -E 'AAPT|Manifest merger failed|error: ' build.log | sed "$CLEAN" | sort -u | head -15 >> "$S"
+            echo '```' >> "$S"
+            echo "::error title=Manifest or resource error::error in AndroidManifest.xml or resources"
+          fi
+
+          if grep -q 'What went wrong' build.log; then
+            echo "### Gradle's own explanation" >> "$S"
+            echo '```' >> "$S"
+            grep -A8 -m1 'What went wrong' build.log | sed "$CLEAN" >> "$S"
+            echo '```' >> "$S"
+            grep -A3 -m1 'What went wrong' build.log | sed "$CLEAN" | tr '\n' ' ' | while IFS= read -r l; do
+              echo "::error title=Gradle says::$l"
+            done
+          fi
+
+          if [ "$FOUND" = "0" ]; then
+            echo "::error title=Build failed::exact cause not detected, see the last 40 lines in the summary"
+          fi
+
+          echo "" >> "$S"
+          echo "<details><summary>Last 40 lines of build log</summary>" >> "$S"
+          echo "" >> "$S"
+          echo '```' >> "$S"
+          tail -n 40 build.log | sed "$CLEAN" >> "$S"
+          echo '```' >> "$S"
+          echo "</details>" >> "$S"
+          exit 0
+
+      - name: "Build log (full)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BuildLog
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "APK ready"
+        if: success()
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          SIZE=$(du -h "$APK" | cut -f1)
+          echo "## ✅ Build successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "APK size: $SIZE. Download it from Artifacts below: PasswordVault-APK" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: PasswordVault-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
